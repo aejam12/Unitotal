@@ -1,13 +1,14 @@
-import streamlit as st
+import os
+import json
 import cv2
 import numpy as np
 import pandas as pd
-import face_recognition
-import json
+import streamlit as st
 from datetime import datetime, date
 from supabase import create_client, Client
+from deepface import DeepFace
 
-# Conexión a la base de datos Supabase
+# Conexión a Supabase
 @st.cache_resource
 def init_supabase():
     url = st.secrets["SUPABASE_URL"]
@@ -21,18 +22,6 @@ st.title("📌 Sistema Web de Asistencia Facial")
 
 menu = st.sidebar.selectbox("Navegación", ["Marcar Asistencia", "Gestión de Trabajadores", "Exportar Reportes"])
 
-# Función para obtener rostros desde la BD
-def obtener_trabajadores():
-    res = supabase.table("trabajadores").select("*").execute()
-    encodings = []
-    ids = []
-    nombres = []
-    for row in res.data:
-        encodings.append(np.array(json.loads(row["encoding"])))
-        ids.append(row["id"])
-        nombres.append(row["nombre"])
-    return encodings, ids, nombres
-
 # ----------------------------------------------------
 # 1. MARCAR ASISTENCIA
 # ----------------------------------------------------
@@ -42,41 +31,61 @@ if menu == "Marcar Asistencia":
     img_buffer = st.camera_input("Enfoca tu rostro frente a la cámara")
 
     if img_buffer:
-        bytes_data = img_buffer.getvalue()
-        cv2_img = cv2.imdecode(np.frombuffer(bytes_data, np.uint8), cv2.IMREAD_COLOR)
-        rgb_img = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB)
+        # Guardar imagen temporal
+        with open("temp_foto.jpg", "wb") as f:
+            f.write(img_buffer.getvalue())
 
-        encodings_db, ids_db, nombres_db = obtener_trabajadores()
-        rostros_capturados = face_recognition.face_encodings(rgb_img)
+        # Obtener trabajadores desde la BD
+        res = supabase.table("trabajadores").select("*").execute()
+        trabajadores = res.data
 
-        if not rostros_capturados:
-            st.error("No se detectó un rostro claro.")
-        else:
-            coincidencias = face_recognition.compare_faces(encodings_db, rostros_capturados[0], tolerance=0.5)
-            if True in coincidencias:
-                idx = coincidencias.index(True)
-                emp_id = ids_db[idx]
-                emp_nombre = nombres_db[idx]
-                fecha_hoy = str(date.today())
-                hora_actual = datetime.now().strftime("%H:%M:%S")
+        reconocido = False
+        emp_id = None
+        emp_nombre = None
 
-                # Consultar si existe registro hoy
-                res = supabase.table("asistencias").select("*").eq("trabajador_id", emp_id).eq("fecha", fecha_hoy).execute()
+        # Comparar foto capturada con la lista guardada
+        for emp in trabajadores:
+            # Descargar imagen del bucket
+            url_foto = emp.get("foto_url")
+            if url_foto:
+                try:
+                    res_match = DeepFace.verify(
+                        img1_path="temp_foto.jpg", 
+                        img2_path=url_foto, 
+                        model_name="VGG-Face", 
+                        enforce_detection=False
+                    )
+                    if res_match.get("verified"):
+                        reconocido = True
+                        emp_id = emp["id"]
+                        emp_nombre = emp["nombre"]
+                        break
+                except Exception:
+                    continue
 
-                if len(res.data) == 0:
-                    data = {
-                        "trabajador_id": emp_id,
-                        "nombre": emp_nombre,
-                        "fecha": fecha_hoy,
-                        tipo: hora_actual
-                    }
-                    supabase.table("asistencias").insert(data).execute()
-                else:
-                    supabase.table("asistencias").update({tipo: hora_actual}).eq("id", res.data[0]["id"]).execute()
+        # Limpiar archivo temporal
+        if os.path.exists("temp_foto.jpg"):
+            os.remove("temp_foto.jpg")
 
-                st.success(f"✅ Registro exitoso: {emp_nombre} ({tipo.replace('_', ' ').title()}) - {hora_actual}")
+        if reconocido:
+            fecha_hoy = str(date.today())
+            hora_actual = datetime.now().strftime("%H:%M:%S")
+
+            res_asistencia = supabase.table("asistencias").select("*").eq("trabajador_id", emp_id).eq("fecha", fecha_hoy).execute()
+
+            if len(res_asistencia.data) == 0:
+                supabase.table("asistencias").insert({
+                    "trabajador_id": emp_id,
+                    "nombre": emp_nombre,
+                    "fecha": fecha_hoy,
+                    tipo: hora_actual
+                }).execute()
             else:
-                st.error("❌ Rostro no reconocido.")
+                supabase.table("asistencias").update({tipo: hora_actual}).eq("id", res_asistencia.data[0]["id"]).execute()
+
+            st.success(f"✅ Registro exitoso: **{emp_nombre}** ({tipo.replace('_', ' ').title()}) a las {hora_actual}")
+        else:
+            st.error("❌ Rostro no reconocido.")
 
 # ----------------------------------------------------
 # 2. GESTIÓN DE TRABAJADORES
@@ -91,30 +100,41 @@ elif menu == "Gestión de Trabajadores":
 
         if st.button("Guardar"):
             if tid and tnombre and foto:
+                nombre_archivo = f"{tid}.jpg"
                 bytes_data = foto.getvalue()
-                cv2_img = cv2.imdecode(np.frombuffer(bytes_data, np.uint8), cv2.IMREAD_COLOR)
-                rgb_img = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB)
-                encs = face_recognition.face_encodings(rgb_img)
 
-                if encs:
-                    encoding_str = json.dumps(encs[0].tolist())
-                    supabase.table("trabajadores").insert({
-                        "id": tid,
-                        "nombre": tnombre,
-                        "encoding": encoding_str
-                    }).execute()
-                    st.success("Empleado registrado correctamente.")
-                else:
-                    st.error("No se detectó un rostro claro.")
+                # Subir foto al bucket 'fotos' en Supabase Storage
+                supabase.storage.from_("fotos").upload(
+                    path=nombre_archivo, 
+                    file=bytes_data, 
+                    file_options={"content-type": "image/jpeg", "x-upsert": "true"}
+                )
+
+                # Obtener la URL pública
+                public_url = supabase.storage.from_("fotos").get_public_url(nombre_archivo)
+
+                # Insertar registro
+                supabase.table("trabajadores").insert({
+                    "id": tid,
+                    "nombre": tnombre,
+                    "foto_url": public_url
+                }).execute()
+
+                st.success(f"Empleado **{tnombre}** registrado correctamente.")
+            else:
+                st.warning("Completa todos los campos y toma la foto.")
 
     with tab2:
-        encodings_db, ids_db, nombres_db = obtener_trabajadores()
-        if ids_db:
-            opciones = [f"{ids_db[i]} - {nombres_db[i]}" for i in range(len(ids_db))]
-            seleccion = st.selectbox("Seleccionar empleado:", opciones)
+        res = supabase.table("trabajadores").select("*").execute()
+        trabajadores = res.data
+        if trabajadores:
+            opciones = {f"{t['id']} - {t['nombre']}": t["id"] for t in trabajadores}
+            seleccion = st.selectbox("Seleccionar empleado:", list(opciones.keys()))
+
             if st.button("Eliminar"):
-                target_id = seleccion.split(" - ")[0]
+                target_id = opciones[seleccion]
                 supabase.table("trabajadores").delete().eq("id", target_id).execute()
+                supabase.storage.from_("fotos").remove([f"{target_id}.jpg"])
                 st.success("Empleado eliminado.")
                 st.rerun()
 
@@ -127,8 +147,8 @@ elif menu == "Exportar Reportes":
         df = pd.DataFrame(res.data)
         st.dataframe(df, use_container_width=True)
 
-        archivo_excel = "asistencia.xlsx"
+        archivo_excel = "reporte_asistencia.xlsx"
         df.to_excel(archivo_excel, index=False, engine="openpyxl")
 
         with open(archivo_excel, "rb") as f:
-            st.download_button("📥 Descargar Excel", f, file_name="reporte_asistencia.xlsx")
+            st.download_button("📥 Descargar Excel", f, file_name="asistencia.xlsx")
