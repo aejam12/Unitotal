@@ -1,5 +1,6 @@
 streamlit
 opencv-python-headless
+dlib-bin
 face-recognition
 pandas
 openpyxl
